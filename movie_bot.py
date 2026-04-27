@@ -1,6 +1,8 @@
 """
-Telegram Movie Watchlist Bot — Render free tier version.
-Now with multi-result search + inline buttons for disambiguation.
+Telegram Movie Watchlist Bot — TMDb edition.
+Uses The Movie Database (TMDb) for up-to-date movie info,
+Flask keepalive for Render free tier, and inline buttons
+for picking between same-named movies.
 """
 
 import os
@@ -16,8 +18,9 @@ from telegram.ext import (
 
 # ---------- CONFIG (from env vars) ----------
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-OMDB_API_KEY   = os.environ["OMDB_API_KEY"]
+TMDB_API_KEY   = os.environ["TMDB_API_KEY"]
 DB_PATH        = os.environ.get("DB_PATH", "watchlist.db")
+TMDB_BASE      = "https://api.themoviedb.org/3"
 # --------------------------------------------
 
 
@@ -51,57 +54,63 @@ def init_db():
 
 
 def search_movies(query: str, max_results: int = 6):
-    """Search OMDb for multiple movies matching the query."""
+    """Search TMDb for movies matching the query."""
     try:
         r = requests.get(
-            "http://www.omdbapi.com/",
-            params={"s": query, "type": "movie", "apikey": OMDB_API_KEY},
+            f"{TMDB_BASE}/search/movie",
+            params={"api_key": TMDB_API_KEY, "query": query, "include_adult": "false"},
             timeout=10,
         ).json()
     except requests.RequestException:
         return []
-    if r.get("Response") == "False":
-        return []
-    # Sort newest first so 2026 versions come above 1997 versions
-    results = r.get("Search", [])
-    results.sort(key=lambda m: m.get("Year", "0"), reverse=True)
+    results = r.get("results", [])
+    # Sort by popularity (TMDb already does this, but make it explicit)
+    results.sort(key=lambda m: m.get("popularity", 0), reverse=True)
     return results[:max_results]
 
 
-def fetch_movie_by_id(imdb_id: str):
-    """Fetch full movie details using its IMDb ID."""
+def fetch_movie_by_id(tmdb_id):
+    """Fetch full movie details using TMDb ID, including cast."""
     try:
         r = requests.get(
-            "http://www.omdbapi.com/",
-            params={"i": imdb_id, "apikey": OMDB_API_KEY},
+            f"{TMDB_BASE}/movie/{tmdb_id}",
+            params={"api_key": TMDB_API_KEY, "append_to_response": "credits"},
             timeout=10,
         ).json()
     except requests.RequestException:
         return None
-    if r.get("Response") == "False":
+    if not r.get("id"):
         return None
+
+    cast = r.get("credits", {}).get("cast", [])
+    actor = cast[0]["name"] if cast else "N/A"
+    genres = ", ".join(g["name"] for g in r.get("genres", [])) or "N/A"
+    rating = r.get("vote_average")
+    rating_str = f"{rating:.1f}" if rating else "N/A"
+    year = (r.get("release_date") or "????")[:4]
+
     return {
-        "title":  r.get("Title", "Unknown"),
-        "year":   r.get("Year", "N/A"),
-        "rating": r.get("imdbRating", "N/A"),
-        "genre":  r.get("Genre", "N/A"),
-        "actor":  (r.get("Actors") or "N/A").split(",")[0].strip(),
-        "imdb_id": r.get("imdbID", imdb_id),
+        "title":   r.get("title", "Unknown"),
+        "year":    year,
+        "rating":  rating_str,
+        "genre":   genres,
+        "actor":   actor,
+        "tmdb_id": str(r.get("id")),
     }
 
 
 def format_movie(m: dict) -> str:
     return (
         f"🎬 *{m['title']}* ({m['year']})\n"
-        f"⭐ IMDb: {m['rating']}\n"
+        f"⭐ TMDb: {m['rating']}/10\n"
         f"🎭 Genre: {m['genre']}\n"
         f"👤 Lead: {m['actor']}"
     )
 
 
-def add_button(imdb_id: str):
+def add_button(tmdb_id: str):
     return InlineKeyboardMarkup(
-        [[InlineKeyboardButton("➕ Add to watchlist", callback_data=f"add:{imdb_id}")]]
+        [[InlineKeyboardButton("➕ Add to watchlist", callback_data=f"add:{tmdb_id}")]]
     )
 
 
@@ -127,20 +136,20 @@ async def lookup(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Single result → show details right away
     if len(results) == 1:
-        movie = fetch_movie_by_id(results[0]["imdbID"])
+        movie = fetch_movie_by_id(results[0]["id"])
         if movie:
             await update.message.reply_text(
                 format_movie(movie),
                 parse_mode="Markdown",
-                reply_markup=add_button(movie["imdb_id"]),
+                reply_markup=add_button(movie["tmdb_id"]),
             )
         return
 
     # Multiple results → show pickable buttons
     keyboard = [
         [InlineKeyboardButton(
-            f"{m.get('Title','?')} ({m.get('Year','?')})",
-            callback_data=f"info:{m['imdbID']}",
+            f"{m.get('title','?')} ({(m.get('release_date') or '????')[:4]})",
+            callback_data=f"info:{m['id']}",
         )]
         for m in results
     ]
@@ -155,11 +164,11 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
     try:
-        action, imdb_id = q.data.split(":", 1)
+        action, tmdb_id = q.data.split(":", 1)
     except ValueError:
         return
 
-    movie = fetch_movie_by_id(imdb_id)
+    movie = fetch_movie_by_id(tmdb_id)
     if not movie:
         await q.edit_message_text("❌ Couldn't fetch details.")
         return
@@ -168,7 +177,7 @@ async def button_handler(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(
             format_movie(movie),
             parse_mode="Markdown",
-            reply_markup=add_button(imdb_id),
+            reply_markup=add_button(tmdb_id),
         )
 
     elif action == "add":
